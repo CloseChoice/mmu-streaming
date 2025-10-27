@@ -9,6 +9,27 @@ This implementation enables efficient crossmatching of large astronomical datase
 - A special `_index` partition is created that contains only the essential coordinate information: `healpix`, `ra`, `dec`, `object_group_id`, and `object_id`
 - This `_index` partition is lightweight and can be loaded entirely into memory
 
+**Directory Structure Example:**
+```
+dataset/
+├── _index/                           # Lightweight index partition
+│   ├── index_000.parquet            # Contains: healpix, ra, dec, object_group_id, object_id
+│   ├── index_001.parquet
+│   └── ...
+├── healpix=0/                        # Spatial partition (HEALPix cell 0)
+│   ├── object_group_id=0/           # Object group 0
+│   │   └── data.parquet             # Full data for these objects
+│   ├── object_group_id=1/           # Object group 1
+│   │   └── data.parquet
+│   └── ...
+├── healpix=1/                        # Spatial partition (HEALPix cell 1)
+│   ├── object_group_id=0/
+│   │   └── data.parquet
+│   └── ...
+└── healpix=2/
+    └── ...
+```
+
 **Crossmatching Workflow:**
 1. Load the `_index` partition for both datasets (small, fast)
 2. Perform spatial crossmatching on the loaded indices
@@ -17,6 +38,12 @@ This implementation enables efficient crossmatching of large astronomical datase
 5. Skip downloading partitions that don't contain any matched objects
 
 This should dramatically reduce time and memory overhead.
+
+---
+
+## Disclaimer
+
+**Note:** The code below was generated using Claude as a rough architectural sketch. This is an exploratory idea and has not been tested or validated. The implementation details may be incomplete, incorrect, or impractical. Treat this as a starting point for discussion. This could very well be AI slop.
 
 ---
 
