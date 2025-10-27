@@ -1,5 +1,28 @@
+# Custom MMU DatasetBuilder Implementation
+
+## Overview
+
+This implementation enables efficient crossmatching of large astronomical datasets by using a two-tier partitioning strategy:
+
+**Partitioning Strategy:**
+- Data is partitioned by two keys: `healpix` (spatial partitioning) and `object_group_id` (grouping multiple object IDs together for efficient loading)
+- A special `_index` partition is created that contains only the essential coordinate information: `healpix`, `ra`, `dec`, `object_group_id`, and `object_id`
+- This `_index` partition is lightweight and can be loaded entirely into memory
+
+**Crossmatching Workflow:**
+1. Load the `_index` partition for both datasets (small, fast)
+2. Perform spatial crossmatching on the loaded indices
+3. Identify which `(healpix, object_group_id)` partitions contain successfully crossmatched objects
+4. Download and load only those specific data partitions that contain matched objects
+5. Skip downloading partitions that don't contain any matched objects
+
+This should dramatically reduce time and memory overhead.
+
+---
+
 # mmu_datasets/builder.py
 
+```python
 from datasets import DatasetBuilder, BuilderConfig, Features, Split, SplitGenerator
 from datasets.download import DownloadManager
 import pyarrow as pa
@@ -10,7 +33,7 @@ from typing import Dict, List, Tuple, Callable, Optional, Any
 
 class MMUConfig(BuilderConfig):
     """Configuration for MMU datasets with crossmatching support"""
-    
+
     def __init__(
         self,
         matching_datasets: Optional[Dict[str, str]] = None,
@@ -21,7 +44,7 @@ class MMUConfig(BuilderConfig):
     ):
         """
         Initialize MMU configuration.
-        
+
         Args:
             matching_datasets: Dict mapping {name: dataset_path} for datasets to crossmatch with
             matching_fn: Function(primary_index, other_indices, config) -> List[(healpix, group)]
@@ -35,7 +58,7 @@ class MMUConfig(BuilderConfig):
 class MMUDatasetBuilder(DatasetBuilder):
     """
     Custom DatasetBuilder for Multimodal Universe datasets.
-    
+
     Implements efficient crossmatching by:
     1. Loading _index partition first
     2. Applying crossmatch function to filter partitions
@@ -275,10 +298,11 @@ class MMUDatasetBuilder(DatasetBuilder):
             Tuple of (object_id, example_dict)
         """
         pass
-
+```
 
 # mmu_datasets/loader.py
 
+```python
 def load_dataset(
     dataset_path: str,
     cross_match: Optional[Tuple[str, ...]] = None,
@@ -455,10 +479,11 @@ class CrossMatchedDatasets:
             New CrossMatchedDatasets with filtered datasets
         """
         pass
-
+```
 
 # mmu_datasets/matching.py
 
+```python
 def spatial_crossmatch_fn(
     primary_index: pa.Table,
     other_indices: Dict[str, pa.Table],
@@ -570,10 +595,11 @@ def _group_by_partition(
         List of unique (healpix, group) tuples
     """
     pass
-
+```
 
 # mmu_datasets/utils.py
 
+```python
 def validate_index_schema(index_table: pa.Table):
     """
     Validate that index table has required columns.
@@ -642,12 +668,13 @@ def _compute_healpix(ra: np.ndarray, dec: np.ndarray, nside: int) -> np.ndarray:
 def _assign_groups(object_ids: np.ndarray, objects_per_group: int) -> np.ndarray:
     """
     Assign objects to groups for partitioning.
-    
+
     Args:
         object_ids: Array of object IDs
         objects_per_group: Target objects per group
-        
+
     Returns:
         Array of group assignments
     """
     pass
+```
