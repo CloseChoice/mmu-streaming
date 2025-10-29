@@ -3,16 +3,99 @@
 # wget -r -np -nH --cut-dirs=1 -R "index.html*" -q https://users.flatironinstitute.org/~polymathic/data/MultimodalUniverse/v1/sdss/sdss.py
 # wget -r -np -nH --cut-dirs=1 -R "index.html*" -q https://users.flatironinstitute.org/~polymathic/data/MultimodalUniverse/v1/sdss/sdss/healpix=1175/
 # wget -r -np -nH --cut-dirs=1 -R "index.html*" -q https://users.flatironinstitute.org/~polymathic/data/MultimodalUniverse/v1/sdss/sdss.py
+
+import subprocess
 from datasets import load_dataset_builder, Dataset
 from mmu.utils import get_catalog
-import pyarrow as pa
 import pyarrow.parquet as pq
 from pathlib import Path
 from huggingface_hub import create_repo
+import shutil
+import numpy as np
+
+# ============================================================================
+# Configuration: Specify healpixels to download
+# ============================================================================
+# Dataset URL structure mapping
+DATASET_URL_PATHS = {
+    "sdss": "sdss",
+    "hsc": "pdr3_dud_22.5",
+}
+
+# HEALPIXELS_TO_DOWNLOAD = [1172, 1173, 1174, 1175]  # Add the healpixels you want here
+DATASET = "hsc"
+HEALPIXELS_TO_DOWNLOAD = [1172, 1173] # 1174, 1175]  # Add the healpixels you want here
+BASE_URL = f"https://users.flatironinstitute.org/~polymathic/data/MultimodalUniverse/v1/{DATASET}"
+LOCAL_DATA_DIR = Path(f"data/MultimodalUniverse/v1/{DATASET}")
+DATASET_SUBDIR = DATASET_URL_PATHS[DATASET]
+
+# ============================================================================
+# Download missing healpixel data
+# ============================================================================
+print("Checking for missing healpixel data...")
+for hp in HEALPIXELS_TO_DOWNLOAD:
+    hp_dir = LOCAL_DATA_DIR / DATASET_SUBDIR / f"healpix={hp}"
+
+    if hp_dir.exists() and any(hp_dir.iterdir()):
+        print(f"  healpix={hp}: already exists, skipping download")
+    else:
+        # import pdb; pdb.set_trace()
+        print(f"  healpix={hp}: downloading...")
+        # Download the healpix partition
+        cmd = [
+            "wget", "-r", "-np", "-nH", "--cut-dirs=1",
+            "-R", "index.html*", "-q",
+            f"{BASE_URL}/{DATASET_SUBDIR}/healpix={hp}/"
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            print(f"    ✓ Downloaded healpix={hp}")
+        else:
+            print(f"    ✗ Failed to download healpix={hp}: {result.stderr}")
+
+# Download sdss.py if not present
+sdss_py = LOCAL_DATA_DIR / f"{DATASET}.py"
+if not sdss_py.exists():
+    print("Downloading sdss.py...")
+    cmd = [
+        "wget", "-r", "-np", "-nH", "--cut-dirs=1",
+        "-R", "index.html*", "-q",
+        f"{BASE_URL}/{DATASET}.py"
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode == 0:
+        print("  ✓ Downloaded sdss.py")
+    else:
+        print(f"  ✗ Failed to download sdss.py: {result.stderr}")
+
+print("Download check complete!\n")
+
+# ============================================================================
+# Clean up healpixel partitions not in the list
+# ============================================================================
+print("Cleaning up unwanted healpixel partitions...")
+sdss_data_dir = LOCAL_DATA_DIR / DATASET_SUBDIR
+if sdss_data_dir.exists():
+    for item in sdss_data_dir.iterdir():
+        if item.is_dir() and item.name.startswith("healpix="):
+            hp_value = int(item.name.split("=")[1])
+            if hp_value not in HEALPIXELS_TO_DOWNLOAD:
+                print(f"  Removing healpix={hp_value} (not in specified list)...")
+                shutil.rmtree(item)
+                print(f"    ✓ Removed healpix={hp_value}")
+print("Cleanup complete!\n")
 
 # Load the dataset descriptions from local copy of the data
 print("Loading SDSS builder...")
-sdss_builder = load_dataset_builder("data/MultimodalUniverse/v1/sdss", trust_remote_code=True)
+sdss_builder = load_dataset_builder(f"data/MultimodalUniverse/v1/{DATASET}", trust_remote_code=True)
+
+# Clear cache to ensure new healpixels are picked up
+print("Clearing dataset cache...")
+import shutil
+cache_dir = Path(sdss_builder.cache_dir)
+if cache_dir.exists():
+    shutil.rmtree(cache_dir)
+    print(f"  ✓ Cleared cache at {cache_dir}")
 
 print("Downloading and preparing dataset...")
 sdss_builder.download_and_prepare()
@@ -26,8 +109,13 @@ print("Loading full dataset...")
 
 def match_sdss_catalog_object_ids(example, catalog):
     example_obj_id = example['object_id'].strip("b'")
+    if np.issubdtype(catalog['object_id'][0], np.integer):
+        example_obj_id = int(example_obj_id)
     catalog_entry = catalog[catalog['object_id'] == example_obj_id]
-    assert len(catalog_entry) == 1
+    try:
+        assert len(catalog_entry) == 1
+    except Exception:
+        import pdb; pdb.set_trace()
     # return {**example, 'ra': catalog_entry['ra'][0], 'dec': catalog_entry['dec'][0], 'healpix': catalog_entry['healpix'][0]}
     return {**example, 'healpix': catalog_entry['healpix'][0]}
 
@@ -82,7 +170,7 @@ print("\n" + "="*60)
 print("Uploading to HuggingFace Hub...")
 print("="*60)
 
-repo_id = "TobiasPitters/mmu-sdss-partitioned"
+repo_id = f"TobiasPitters/mmu-{DATASET}-partitioned"
 
 # Option 1: Upload the entire directory structure
 # This preserves the _index and healpix= partition structure
