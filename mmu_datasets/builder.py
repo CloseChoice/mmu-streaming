@@ -12,6 +12,9 @@ from datasets.packaged_modules.parquet.parquet import Parquet, ParquetConfig
 from datasets import config
 import numpy as np
 
+from astropy.table import Table, hstack
+from astropy.coordinates import SkyCoord
+from astropy import units as u
 
 @dataclass
 # class MMUConfig(BuilderConfig):
@@ -66,27 +69,34 @@ class MMUDatasetBuilder(Parquet):
         """Initialize builder and prepare for index-aware loading."""
         left_dataset = kwargs.get("left_dataset", "default_left")
         right_dataset = kwargs.get("right_dataset", "default_right")
+        self.all_files = {"left": [], "right": []}
         cache_dir = Path(config.DEFAULT_HF_DATASETS_CACHE) / f"{left_dataset.replace('/', '_')}_{right_dataset.replace('/', '_')}"
         super().__init__(*args, **kwargs, cache_dir=cache_dir)
+
+        self.left_name = self.config.left_dataset.split("/")[-1]
+        self.right_name = self.config.right_dataset.split("/")[-1]
         self._relevant_partitions: Optional[List[Tuple[int, int]]] = None
 
     def _download_and_prepare(self, dl_manager, verification_mode, **prepare_split_kwargs):
         index_tables = self._download_and_load_index(dl_manager)
-        self.crossmatch_index_tables(*index_tables)
+        matched_catalog = self.crossmatch_index_tables(*index_tables)
+        self.download_matched_catalog(dl_manager, matched_catalog)
+
+    def download_matched_catalog(self, dl_manager: DownloadManager, matched_catalog: Table):
+        left_object_ids = matched_catalog[f'{self.left_name}_object_id']
+        right_object_ids = matched_catalog[f'{self.right_name}_object_id']
+        files_to_download = {k: [f for f in v if f.endswith(".parquet") and not f.endswith("_index/index.parquet")] for k, v self.all_files.items()}
+        for dataset, files in files_to_download.items():
+            file_urls = [f"hf://datasets/{f}" for f in files]
+            downloaded_files = dl_manager.download(file_urls)
+            
 
 
     def crossmatch_index_tables(self, left, right,
                                 matching_radius : float = 1., 
                                 ):
-        from astropy.table import Table, hstack
-        from astropy.coordinates import SkyCoord
-        from astropy import units as u
-        import pdb; pdb.set_trace()
-        # coordinate_columns = ['ra', 'dec', 'healpix', 'object_id']
         left = Table.from_pandas(left.to_pandas())
         right = Table.from_pandas(right.to_pandas())
-        left_name = self.config.left_dataset.split("/")[-1]
-        right_name = self.config.right_dataset.split("/")[-1]
 
         left['sc'] = SkyCoord(left['ra'], 
                               left['dec'], unit='deg')
@@ -103,26 +113,25 @@ class MMUDatasetBuilder(Parquet):
         assert len(cat_left) == len(cat_right), "There was an error in the cross-matching."
         print("Initial number of matches: ", len(cat_left))
         matched_catalog = hstack([cat_left, cat_right], 
-                                 table_names=[left_name, right_name],
+                                 table_names=[self.left_name, self.right_name],
                                  uniq_col_name='{table_name}_{col_name}')
         # Remove objects that were matched between the two catalogs but fall under different healpix indices
-        mask = matched_catalog[f'{left_name}_healpix'] == matched_catalog[f'{right_name}_healpix']
+        mask = matched_catalog[f'{self.left_name}_healpix'] == matched_catalog[f'{self.right_name}_healpix']
         matched_catalog = matched_catalog[mask]
         print("Number of matches lost at healpix region borders: ", len(cat_left) - len(matched_catalog))
         print("Final size of cross-matched catalog: ", len(matched_catalog))
 
         # Adding default columns to respect format
-        matched_catalog['object_id'] = matched_catalog[left_name+'_object_id']
-        matched_catalog['ra'] = 0.5*(matched_catalog[left_name+'_ra'] +
-                                     matched_catalog[right_name+'_ra'])
-        matched_catalog['dec'] = 0.5*(matched_catalog[left_name+'_dec'] +
-                                     matched_catalog[right_name+'_dec'])
+        matched_catalog['object_id'] = matched_catalog[self.left_name+'_object_id']
+        matched_catalog['ra'] = 0.5*(matched_catalog[self.left_name+'_ra'] +
+                                     matched_catalog[self.right_name+'_ra'])
+        matched_catalog['dec'] = 0.5*(matched_catalog[self.left_name+'_dec'] +
+                                     matched_catalog[self.right_name+'_dec'])
         
         # Check that all matches have the same healpix index
-        assert np.all(matched_catalog[left_name+'_healpix'] == matched_catalog[right_name+'_healpix']), "There was an error in the cross-matching."
-        matched_catalog['healpix'] = matched_catalog[left_name+'_healpix']
+        assert np.all(matched_catalog[self.left_name+'_healpix'] == matched_catalog[self.right_name+'_healpix']), "There was an error in the cross-matching."
+        matched_catalog['healpix'] = matched_catalog[self.left_name+'_healpix']
         matched_catalog = matched_catalog.group_by(['healpix'])
-        import pdb; pdb.set_trace()
         return matched_catalog
 
     def _download_and_load_index(self, dl_manager: DownloadManager) -> List[pa.Table]:
@@ -159,11 +168,13 @@ class MMUDatasetBuilder(Parquet):
         Returns:
             List of HF URLs (e.g., ["hf://datasets/org/dataset/train/_index/file.parquet"])
         """
-        all_files = self._list_repository_files()
+        self.all_files = self._list_repository_files()
 
         # Filter for index partition files (under split_name/_index/)
+        import pdb; pdb.set_trace()
+        all_files_flat = self.all_files[self.left_name] + self.all_files[self.right_name]
         index_files = [
-            f for f in all_files
+            f for f in all_files_flat
             if f.endswith("_index/index.parquet")
         ]
         index_urls = [f"hf://datasets/{f}" for f in index_files]
@@ -190,8 +201,7 @@ class MMUDatasetBuilder(Parquet):
                 raise ValueError(f"Failed to list files in repository {repo_id}: {e}")
 
 
-
-    def _list_repository_files(self) -> List[str]:
+    def _list_repository_files(self) -> Dict[str, str]:
         """List all files in the dataset repository.
 
         Returns:
@@ -199,7 +209,8 @@ class MMUDatasetBuilder(Parquet):
         """
         files_left = self._list_repo_files_single_ds(self.config.left_dataset)
         files_right = self._list_repo_files_single_ds(self.config.right_dataset)
-        return files_left + files_right
+        return {self.left_name: files_left,
+                self.right_name: files_right}
 
     def _extract_repo_id_from_url(self, url: str) -> str:
         """Extract repo_id from HuggingFace URL.
