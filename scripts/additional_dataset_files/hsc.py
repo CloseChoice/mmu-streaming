@@ -212,6 +212,7 @@ class HSC(datasets.GeneratorBasedBuilder):
     def _generate_examples(self, files, object_ids=None):
         """ Yields examples as (key, example) tuples.
         """
+        import pdb; pdb.set_trace()
         for j, file in enumerate(files):
             with h5py.File(file, "r") as data:
                 if object_ids is not None:
