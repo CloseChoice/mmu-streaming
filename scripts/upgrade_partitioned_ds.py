@@ -24,8 +24,9 @@ DATASET_URL_PATHS = {
 }
 
 # HEALPIXELS_TO_DOWNLOAD = [1172, 1173, 1174, 1175]  # Add the healpixels you want here
+# DATASET = "sdss"
 DATASET = "hsc"
-HEALPIXELS_TO_DOWNLOAD = [1172, 1173] # 1174, 1175]  # Add the healpixels you want here
+HEALPIXELS_TO_DOWNLOAD = [1172, 1173]  # Add the healpixels you want here
 BASE_URL = f"https://users.flatironinstitute.org/~polymathic/data/MultimodalUniverse/v1/{DATASET}"
 LOCAL_DATA_DIR = Path(f"data/MultimodalUniverse/v1/{DATASET}")
 DATASET_SUBDIR = DATASET_URL_PATHS[DATASET]
@@ -110,7 +111,9 @@ print("Loading full dataset...")
 
 def match_sdss_catalog_object_ids(example, catalog):
     example_obj_id = example['object_id'].strip("b'")
-    if np.issubdtype(catalog['object_id'][0], np.integer):
+    if isinstance(example_obj_id, str) and isinstance(catalog['object_id'][0], str):
+        example_obj_id = example_obj_id
+    elif np.issubdtype(catalog['object_id'][0], np.integer):
         example_obj_id = int(example_obj_id)
     catalog_entry = catalog[catalog['object_id'] == example_obj_id]
     try:
@@ -133,8 +136,9 @@ catalog_dict = {
 index_dataset = Dataset.from_dict(catalog_dict)
 
 # Create output directory structure
-output_dir = Path("output_dataset")
-output_dir.mkdir(exist_ok=True)
+upload_path = Path(f"output_dataset/{DATASET}")
+output_dir = upload_path / "train"
+output_dir.mkdir(parents=True, exist_ok=True)
 
 # Save the _index partition (not partitioned by healpix)
 print("Saving _index partition...")
@@ -146,6 +150,7 @@ index_dataset.to_parquet(str(index_path / "index.parquet"))
 print("Saving main dataset partitioned by healpix...")
 # Group by healpix and save each partition
 for split, healpix_list in sdss_dataset.unique('healpix').items():
+    # todo: we ignore the split in here! So we implicitly imply there is only one and this is train!
     for hp_value in healpix_list:
         print(f"  Processing healpix={hp_value}...")
         # Filter dataset for this healpix value
@@ -157,7 +162,7 @@ for split, healpix_list in sdss_dataset.unique('healpix').items():
 
         # Save partition - convert to arrow table first
         memory_mapped_table = hp_dataset.data
-        target_path = Path( hp_dir / split )
+        target_path = Path( hp_dir )
         target_path.mkdir(exist_ok=True)
         pq.write_table(memory_mapped_table.table, target_path / "data.parquet")
     # pq.write_table(arrow_table, hp_dir / "data.parquet")
@@ -185,7 +190,7 @@ create_repo(
     exist_ok=True,
 )
 api.upload_folder(
-    folder_path=str(output_dir),
+    folder_path=str(upload_path),
     repo_id=repo_id,
     repo_type="dataset",
     path_in_repo=".",
