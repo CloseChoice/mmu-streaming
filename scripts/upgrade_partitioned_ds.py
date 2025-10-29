@@ -1,3 +1,4 @@
+# Execute with datasets==3.6 && numpy<2
 # Needs to be executed from within the scripts directory
 # wget -r -np -nH --cut-dirs=1 -R "index.html*" -q https://users.flatironinstitute.org/~polymathic/data/MultimodalUniverse/v1/sdss/pdr3_dud_22.5/healpix=1175/
 # wget -r -np -nH --cut-dirs=1 -R "index.html*" -q https://users.flatironinstitute.org/~polymathic/data/MultimodalUniverse/v1/sdss/sdss.py
