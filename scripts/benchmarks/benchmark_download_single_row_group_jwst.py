@@ -1,7 +1,6 @@
+import pyarrow as pa
 import pyarrow.parquet as pq
 from huggingface_hub import HfFileSystem
-from datasets import load_dataset
-from datasets.download.download_manager import DownloadManager
 import pyarrow.compute as pc
 
 
@@ -10,7 +9,7 @@ import pyarrow.compute as pc
 REPO_ID = "MultimodalUniverse/jwst"
 FILE_PATH = "all/train-00000-of-00027.parquet"  # Example file
 
-def find_row_group_and_download(target_id: str):
+def find_row_group_and_download(target_ids: list[str]):
     hf_fs = HfFileSystem()
     full_path = f"datasets/{REPO_ID}/{FILE_PATH}"
 
@@ -20,44 +19,62 @@ def find_row_group_and_download(target_id: str):
     print(f"File has {parquet_file.num_row_groups} row groups")
     print()
 
+    # Read only object_id column to find which row groups contain our targets
     object_id_table = pq.read_table(
         hf_fs.open(full_path, "rb"),
         columns=['object_id']
     )
 
-    matches = pc.equal(object_id_table['object_id'], target_id)
-    row_index = pc.index(matches, True).as_py()
+    # Find all row indices that match any of our target IDs
+    matches = pc.is_in(object_id_table['object_id'], pa.array(target_ids))
+    matching_indices = pc.indices_nonzero(matches).to_pylist()
 
+    if not matching_indices:
+        print(f"✗ None of the target object_ids found in file")
+        return None
+
+    # Determine which row groups contain matches
+    target_row_groups = set()
     cumulative_rows = 0
-    target_row_group = None
 
     for i in range(parquet_file.num_row_groups):
         row_group = parquet_file.metadata.row_group(i)
         rows_in_group = row_group.num_rows
 
-        if cumulative_rows <= row_index < cumulative_rows + rows_in_group:
-            target_row_group = i
-            break
+        # Check if any matching index falls in this row group
+        for idx in matching_indices:
+            if cumulative_rows <= idx < cumulative_rows + rows_in_group:
+                target_row_groups.add(i)
 
         cumulative_rows += rows_in_group
 
-    table = parquet_file.read_row_group(
-        target_row_group,
-        # filters=pc.field("object_id") == target_id
-    )
+    print(f"Found matches in {len(target_row_groups)} row group(s): {sorted(target_row_groups)}")
 
-    # Verify our target object is in this row group
-    matches = pc.equal(table['object_id'], target_id)
-    if pc.any(matches).as_py():
-        row_idx = pc.index(matches, True).as_py()
-        row = table.slice(row_idx, 1).to_pydict()
-        pq.write_table(table.slice(row_idx, 1), "temp_partial.parquet")
-        return row
+    # Read only the necessary row groups and combine them
+    tables = []
+    for rg_idx in sorted(target_row_groups):
+        table = parquet_file.read_row_group(rg_idx)
+        tables.append(table)
+
+    # Combine all row groups
+    if len(tables) == 1:
+        combined_table = tables[0]
     else:
-        print(f"✗ object_id '{target_id}' not found in this row group")
+        combined_table = pa.concat_tables(tables)
+
+    # Filter to only rows matching our target IDs
+    matches = pc.is_in(combined_table['object_id'], pa.array(target_ids))
+    filtered_table = combined_table.filter(matches)
+
+    if filtered_table.num_rows > 0:
+        pq.write_table(filtered_table, "temp_partial.parquet")
+        return filtered_table.to_pydict()
+    else:
+        print(f"✗ None of the target object_ids found in row groups")
+        return None
 
 
-def demo_load_full_file(target_id: str):
+def demo_load_full_file(target_ids: list[str]):
     hf_fs = HfFileSystem()
     full_path = f"datasets/{REPO_ID}/{FILE_PATH}"
 
@@ -68,28 +85,21 @@ def demo_load_full_file(target_id: str):
 
     table = pq.read_table(
         hf_fs.open(full_path, "rb"),
-        filters=pc.field("object_id") == target_id
+        filters=pc.field("object_id").isin(pa.array(target_ids))
     )
-    matches = pc.equal(table['object_id'], target_id)
-    if pc.any(matches).as_py():
-        row_idx = pc.index(matches, True).as_py()
-        row = table.slice(row_idx, 1).to_pydict()
-        pq.write_table(table.slice(row_idx, 1), "temp_full.parquet")
-        return row
-    else:
-        print(f"✗ object_id '{target_id}' not found in this row group")
+    pq.write_table(table, "temp_full.parquet")
+    return table.to_pydict()
 
 
 if __name__ == "__main__":
     import time
-    target_id = "1757963689505762345"
+    target_ids = ["1757963689505762345", "1757963689505748225"]
     t1 = time.time()
-    row = find_row_group_and_download(target_id)
+    rows = find_row_group_and_download(target_ids)
     elapsed1 = time.time() - t1
     t2 = time.time()
-    row2 = demo_load_full_file(target_id)
+    rows2 = demo_load_full_file(target_ids)
     elapsed2 = time.time() - t2
     print(f"Row group: {elapsed1:.2f}s | Full file: {elapsed2:.2f}s | Speedup: {elapsed2/elapsed1:.1f}x")
-    import pdb; pdb.set_trace()
-    assert row == row2
+    assert rows == rows2
 
