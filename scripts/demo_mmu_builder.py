@@ -25,6 +25,9 @@ def demo_simple_loading():
 
     builder.download_and_prepare()
     dataset = builder.as_dataset()
+    import ipdb; ipdb.set_trace(context=20)
+    for entry in dataset['train'].select(range(5)):
+        print(entry)
 
 
 def demo_crossmatching():

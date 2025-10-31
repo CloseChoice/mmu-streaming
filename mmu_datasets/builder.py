@@ -5,8 +5,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pyarrow.compute as pc
-from datasets import ArrowBasedBuilder, BuilderConfig, DatasetInfo, Features, SplitGenerator
+from datasets import ArrowBasedBuilder, BuilderConfig, DatasetInfo, Features, SplitGenerator, Split, SplitDict
 from datasets.download.download_manager import DownloadManager
+from datasets.arrow_writer import ArrowWriter
 from datasets.utils.file_utils import is_remote_url
 from huggingface_hub import HfFileSystem
 from datasets.packaged_modules.parquet.parquet import Parquet, ParquetConfig
@@ -24,7 +25,7 @@ from astropy import units as u
 
 # todo: move to config
 CROSS_MATCH_COLS = ['ra', 'dec', 'object_id', "healpix"]
-FILE_PARTITION_PATTERN = "(healpix=\d+)\/"
+FILE_PARTITION_PATTERN = r"(healpix=\d+)\/"
 
 @dataclass
 # class MMUConfig(BuilderConfig):
@@ -89,26 +90,166 @@ class MMUDatasetBuilder(Parquet):
         self.hf_fs = HfFileSystem()
 
     def _download_and_prepare(self, dl_manager, verification_mode, **prepare_split_kwargs):
+        """Downloads and prepares dataset following the datasets library pattern.
+
+        This method:
+        1. Downloads and crossmatches index tables
+        2. Downloads and joins matched data
+        3. Writes partitioned parquet files to train split
+        4. Updates dataset info with split information
+        """
+        # Step 1: Download indices and perform crossmatching
         index_tables = self._download_and_load_crossmatching_cols(dl_manager)
         matched_catalog = self.crossmatch_index_tables(*index_tables)
-        self.download_matched_catalog(matched_catalog)
 
+        # Step 2: Write matched data to partitioned structure
+        split_info = self._write_matched_data_to_train_split(matched_catalog)
 
-    def download_matched_catalog(self, matched_catalog: Table):
-        left_files = pc.unique(matched_catalog[self.left_name + "_file"]).tolist()
-        left_grouped = matched_catalog.group_by(self.left_name + "_file")
-        left_files = {group[self.left_name + "_file"][0]: group[self.left_name + "_object_id"].tolist() for group in left_grouped.groups}
-        right_grouped = matched_catalog.group_by(self.left_name + "_file")
-        right_files = {group[self.right_name + "_file"][0]: group[self.right_name + "_object_id"].tolist() for group in right_grouped.groups}
-        lt_iter = self._download_files(left_files)
-        rt_iter = self._download_files(right_files)
-        idx = 0
+        # Step 3: Update info object with splits
+        split_dict = SplitDict(dataset_name=self.dataset_name)
+        split_dict.add(split_info)
+        self.info.splits = split_dict
+        self.info.dataset_size = split_info.num_bytes
+        self.info.download_size = dl_manager.downloaded_size
 
-        mc_objects = pa.table(matched_catalog[[self.left_name + "_object_id", self.right_name + "_object_id"]].to_pandas())
-        for left_table, right_table in zip(lt_iter, rt_iter):
-            lm = pl.from_arrow(left_table).join(pl.from_arrow(mc_objects), left_on="object_id", right_on=self.left_name + "_object_id", how="inner")
-            # lm = self._merge_tables_with_lists(left_table, mc_objects, "object_id", self.left_name + "_object_id")
-            lmr = lm.join(pl.from_arrow(right_table), left_on=self.right_name + "_object_id", right_on="object_id", how="inner")
+    def _write_matched_data_to_train_split(self, matched_catalog):
+        """Write matched catalog data to train split with partition structure.
+
+        Structure: cache_dir/train/<partition-name>/data.parquet
+
+        Returns:
+            SplitInfo with statistics about the written data
+        """
+        from datasets import SplitInfo, Split
+
+        # Prepare output directory: cache_dir/train/
+        train_dir = Path(self._output_dir) / "train"
+        train_dir.mkdir(parents=True, exist_ok=True)
+
+        # Group matched catalog by healpix partition
+        partitions = {}
+        for group in matched_catalog.groups:
+            healpix = group['healpix'][0]
+            partition_name = f"healpix={healpix}"
+            partitions[partition_name] = group
+
+        total_num_examples = 0
+        total_num_bytes = 0
+
+        # Process each partition
+        for partition_name, partition_catalog in partitions.items():
+            # Create partition directory
+            partition_dir = train_dir / partition_name
+            partition_dir.mkdir(parents=True, exist_ok=True)
+
+            # Get files for this partition
+            left_grouped = partition_catalog.group_by(self.left_name + "_file")
+            left_files = {group[self.left_name + "_file"][0]: group[self.left_name + "_object_id"].tolist()
+                          for group in left_grouped.groups}
+            right_grouped = partition_catalog.group_by(self.right_name + "_file")
+            right_files = {group[self.right_name + "_file"][0]: group[self.right_name + "_object_id"].tolist()
+                           for group in right_grouped.groups}
+
+            # Download and join data
+            lt_iter = self._download_files_single_partition(left_files)
+            rt_iter = self._download_files_single_partition(right_files)
+
+            mc_objects = pa.table(partition_catalog[[self.left_name + "_object_id",
+                                                    self.right_name + "_object_id"]].to_pandas())
+
+            partition_tables = []
+            for left_table, right_table in zip(lt_iter, rt_iter):
+                # Join left with matched catalog
+                lm = pl.from_arrow(left_table).join(
+                    pl.from_arrow(mc_objects),
+                    left_on="object_id",
+                    right_on=self.left_name + "_object_id",
+                    how="inner"
+                )
+                # Join with right table
+                lmr = lm.join(
+                    pl.from_arrow(right_table),
+                    left_on=self.right_name + "_object_id",
+                    right_on="object_id",
+                    how="inner"
+                )
+                partition_tables.append(lmr.to_arrow())
+
+            # Concatenate all tables for this partition
+            if partition_tables:
+                partition_table = pa.concat_tables(partition_tables)
+
+                # Write to parquet file
+                output_file = partition_dir / "data.parquet"
+                pq.write_table(partition_table, output_file)
+
+                total_num_examples += partition_table.num_rows
+                total_num_bytes += output_file.stat().st_size
+
+        # Create and return split info
+        split_info = SplitInfo(
+            name="train",
+            num_examples=total_num_examples,
+            num_bytes=total_num_bytes
+        )
+
+        return split_info
+
+    def _download_files_single_partition(self, files):
+        """Download and yield tables for files in a single partition.
+
+        Args:
+            files: Dict mapping file paths to lists of object IDs
+
+        Yields:
+            PyArrow tables for each file
+        """
+        for file, obj_ids in files.items():
+            yield self._process_file(file, obj_ids)
+
+    def _build_single_dataset(
+        self,
+        split,
+        in_memory,
+        **dataset_kwargs,
+    ):
+        """Override to load from custom partition structure.
+
+        Reads parquet files from train/<partition>/data.parquet instead of
+        the standard arrow file format.
+        """
+        from datasets import Dataset, concatenate_datasets
+
+        # Get the train directory
+        train_dir = Path(self._output_dir) / "train"
+
+        if not train_dir.exists():
+            raise FileNotFoundError(f"Train directory not found: {train_dir}")
+
+        # Find all partition directories
+        partition_dirs = [d for d in train_dir.iterdir() if d.is_dir() and d.name.startswith("healpix=")]
+
+        if not partition_dirs:
+            raise FileNotFoundError(f"No partition directories found in {train_dir}")
+
+        # Load datasets from each partition
+        datasets = []
+        for partition_dir in sorted(partition_dirs):
+            parquet_file = partition_dir / "data.parquet"
+            if parquet_file.exists():
+                # Load the parquet file as a Dataset
+                table = pq.read_table(parquet_file)
+                ds = Dataset(pa.table(table))
+                datasets.append(ds)
+
+        if not datasets:
+            raise FileNotFoundError(f"No data.parquet files found in partition directories")
+
+        # Concatenate all partition datasets
+        if len(datasets) == 1:
+            return datasets[0]
+        else:
+            return concatenate_datasets(datasets)
 
     def _download_files(self, files):
         # Group files by partition
