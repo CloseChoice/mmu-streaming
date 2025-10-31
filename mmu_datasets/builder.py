@@ -14,6 +14,8 @@ from datasets import config
 import numpy as np
 import re
 
+# todo: maybe we can get around polars?!
+import polars as pl
 
 from astropy.table import Table, hstack
 from astropy.coordinates import SkyCoord
@@ -91,6 +93,7 @@ class MMUDatasetBuilder(Parquet):
         matched_catalog = self.crossmatch_index_tables(*index_tables)
         self.download_matched_catalog(matched_catalog)
 
+
     def download_matched_catalog(self, matched_catalog: Table):
         left_files = pc.unique(matched_catalog[self.left_name + "_file"]).tolist()
         left_grouped = matched_catalog.group_by(self.left_name + "_file")
@@ -99,22 +102,13 @@ class MMUDatasetBuilder(Parquet):
         right_files = {group[self.right_name + "_file"][0]: group[self.right_name + "_object_id"].tolist() for group in right_grouped.groups}
         lt_iter = self._download_files(left_files)
         rt_iter = self._download_files(right_files)
-        # todo sort tables by matched catalog
         idx = 0
 
         mc_objects = pa.table(matched_catalog[[self.left_name + "_object_id", self.right_name + "_object_id"]].to_pandas())
         for left_table, right_table in zip(lt_iter, rt_iter):
-            # todo: join left to matched catalog, then result on right, use left_prefix, right_prefix for coordinate_columns
-            lm = left_table.join(mc_objects, keys="object_id", right_keys=self.left_name + "_object_id", join_type="inner")
-            lmr = lm.join(right_table, keys=self.right_name + "_object_id", join_type="inner", left_prefix=self.left_name + "_", right_prefix=self.right_name + "_")
-
-            import ipdb; ipdb.set_trace(context=20)
-            l = matched_catalog[matched_catalog[self.left_name + "_object_id"] == left_table['object_id'][0].as_py()]
-            r = matched_catalog[matched_catalog[self.right_name + "_object_id"] == right_table['object_id'][0].as_py()]
-
-            idx += 1
-            if idx > 10:
-                break
+            lm = pl.from_arrow(left_table).join(pl.from_arrow(mc_objects), left_on="object_id", right_on=self.left_name + "_object_id", how="inner")
+            # lm = self._merge_tables_with_lists(left_table, mc_objects, "object_id", self.left_name + "_object_id")
+            lmr = lm.join(pl.from_arrow(right_table), left_on=self.right_name + "_object_id", right_on="object_id", how="inner")
 
     def _download_files(self, files):
         # Group files by partition
