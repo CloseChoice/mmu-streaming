@@ -4,6 +4,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pyarrow.compute as pc
 from datasets import ArrowBasedBuilder, BuilderConfig, DatasetInfo, Features, SplitGenerator
 from datasets.download.download_manager import DownloadManager
 from datasets.utils.file_utils import is_remote_url
@@ -11,6 +12,7 @@ from huggingface_hub import HfFileSystem
 from datasets.packaged_modules.parquet.parquet import Parquet, ParquetConfig
 from datasets import config
 import numpy as np
+
 
 from astropy.table import Table, hstack
 from astropy.coordinates import SkyCoord
@@ -78,39 +80,38 @@ class MMUDatasetBuilder(Parquet):
         self._relevant_partitions: Optional[List[Tuple[int, int]]] = None
 
     def _download_and_prepare(self, dl_manager, verification_mode, **prepare_split_kwargs):
+        import pdb; pdb.set_trace()
         index_tables = self._download_and_load_index(dl_manager)
+        import pdb; pdb.set_trace()
         matched_catalog = self.crossmatch_index_tables(*index_tables)
-        self.download_matched_catalog(dl_manager, matched_catalog)
+        import pdb; pdb.set_trace()
+        self.download_matched_catalog(matched_catalog)
 
-    def download_matched_catalog(self, dl_manager: DownloadManager, matched_catalog: Table):
+    def download_matched_catalog(self, matched_catalog: Table):
         left_object_ids = matched_catalog[f'{self.left_name}_object_id']
         right_object_ids = matched_catalog[f'{self.right_name}_object_id']
         files_to_download = {k: [f for f in v if f.endswith(".parquet") and not f.endswith("_index/index.parquet")] for k, v in self.all_files.items()}
+        left_files = files_to_download[self.left_name]
+        right_files = files_to_download[self.right_name]
         import pdb; pdb.set_trace()
-        for dataset, files in files_to_download.items():
-            file_urls = [f"hf://datasets/{f}" for f in files]
-            downloaded_files = dl_manager.download(file_urls)
-            # no idea why these files are so strangely formatted!, fix this. WHY is " (origin=)" in there???
-            # [/home/tobias/.cache/huggingface/hub/datasets--TobiasPitters--mmu-sdss-partitioned/snapshots/2f96e29fdea22c60c93b47f2fe90d74c153178e5/train/healpix=1172/data.parquet (origin=hf://datasets/TobiasPitters/mmu-sdss-partitioned/train/healpix=1172/data.parquet), /home/tobias/.cache/huggingface/hub/datasets--TobiasPitters--mmu-sdss-partitioned/snapshots/2f96e29fdea22c60c93b47f2fe90d74c153178e5/train/healpix=1173/data.parquet (origin=hf://datasets/TobiasPitters/mmu-sdss-partitioned/train/healpix=1173/data.parquet)]
-            downloaded_files = [f.split(" ")[0] for f in downloaded_files]
-            if dataset == self.left_name:
-                left_partitions = self.filter_partitions_by_object_ids(downloaded_files, left_object_ids, dataset, "healpix")
-                # remove files
-            else:
-                right_partitions = self.filter_partitions_by_object_ids(downloaded_files, right_object_ids, dataset, "healpix")
-            
-    def filter_partitions_by_object_ids(self, downloaded_files: List[str], object_ids: Any, dataset_name: str, partition_col: str) -> List[str]:
-        relevant_partitions = set()
-        for file_path in downloaded_files:
-            table = pq.read_table(file_path, columns=[f'object_id'])
-            import pdb; pdb.set_trace()
-            table_rows = table.filter(pa.compute.field(f'object_id').is_in(object_ids))
-            unique_values = table_rows[partition_col].unique()
-            ids_in_partition = table[f'{dataset_name}_object_id'].to_pandas().values
-            if np.intersect1d(ids_in_partition, object_ids).size > 0:
-                relevant_partitions.add(file_path)
-        return list(relevant_partitions)
+        left_table = self._download_files(left_files, left_object_ids)
+        right_table = self._download_files(right_files, right_object_ids)
+        # todo sort tables by matched catalog
 
+
+    def _download_files(self, files: list[str], object_ids) -> pa.Table:
+        file_paths = [f"datasets/{f}" for f in files]
+        hf_fs = HfFileSystem()
+
+        tables = []
+
+        for file_path in file_paths:
+            table = pq.read_table(
+                hf_fs.open(file_path, "rb"),
+                filters=pc.field("object_id").isin(pa.array(object_ids))
+            )
+            tables.append(table)
+        return pa.concat_tables(tables)
 
     def crossmatch_index_tables(self, left, right,
                                 matching_radius : float = 1., 

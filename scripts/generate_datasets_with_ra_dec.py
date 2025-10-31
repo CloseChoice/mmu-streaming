@@ -24,8 +24,9 @@ def match_hsc_catalog_object_ids(example, catalog):
     assert len(catalog_entry) == 1
     return {**example, 'ra': catalog_entry['ra'][0], 'dec': catalog_entry['dec'][0], 'healpix': catalog_entry['healpix'][0]}
 
-sdss_mapped = sdss.as_dataset().map(lambda example: match_sdss_catalog_object_ids(example, sdss_catalog))
-sdss_mapped.push_to_hub("TobiasPitters/mmu-sdss-with-coordinates")
+sdss_train = sdss.as_dataset(split="train")
+sdss_mapped = sdss_train.map(lambda example: match_sdss_catalog_object_ids(example, sdss_catalog))
+sdss_mapped.push_to_hub("TobiasPitters/mmu-sdss-with-coordinates", split="train")
 
-hsc_mapped = hsc.as_dataset().map(lambda example: match_hsc_catalog_object_ids(example, hsc_catalog))
-hsc_mapped.push_to_hub("TobiasPitters/mmu-hsc-with-coordinates")
+# hsc_mapped = hsc.as_dataset().map(lambda example: match_hsc_catalog_object_ids(example, hsc_catalog))
+# hsc_mapped.push_to_hub("TobiasPitters/mmu-hsc-with-coordinates")
