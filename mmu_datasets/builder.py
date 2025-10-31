@@ -12,11 +12,17 @@ from huggingface_hub import HfFileSystem
 from datasets.packaged_modules.parquet.parquet import Parquet, ParquetConfig
 from datasets import config
 import numpy as np
+import re
 
 
 from astropy.table import Table, hstack
 from astropy.coordinates import SkyCoord
 from astropy import units as u
+
+
+# todo: move to config
+CROSS_MATCH_COLS = ['ra', 'dec', 'object_id', "healpix"]
+FILE_PARTITION_PATTERN = "(healpix=\d+)\/"
 
 @dataclass
 # class MMUConfig(BuilderConfig):
@@ -81,7 +87,7 @@ class MMUDatasetBuilder(Parquet):
 
     def _download_and_prepare(self, dl_manager, verification_mode, **prepare_split_kwargs):
         import pdb; pdb.set_trace()
-        index_tables = self._download_and_load_index(dl_manager)
+        index_tables = self._download_and_load_crossmatching_cols(dl_manager)
         import pdb; pdb.set_trace()
         matched_catalog = self.crossmatch_index_tables(*index_tables)
         import pdb; pdb.set_trace()
@@ -114,7 +120,8 @@ class MMUDatasetBuilder(Parquet):
         return pa.concat_tables(tables)
 
     def crossmatch_index_tables(self, left, right,
-                                matching_radius : float = 1., 
+                                # todo: change back to one
+                                matching_radius : float = 2000., 
                                 ):
         left = Table.from_pandas(left.to_pandas())
         right = Table.from_pandas(right.to_pandas())
@@ -155,7 +162,7 @@ class MMUDatasetBuilder(Parquet):
         matched_catalog = matched_catalog.group_by(['healpix'])
         return matched_catalog
 
-    def _download_and_load_index(self, dl_manager: DownloadManager) -> List[pa.Table]:
+    def _download_and_load_crossmatching_cols(self, dl_manager: DownloadManager) -> List[pa.Table]:
         """Download and load the _index partition into memory.
 
         Args:
@@ -164,23 +171,33 @@ class MMUDatasetBuilder(Parquet):
         Returns:
             PyArrow Table containing the index data
         """
-        index_urls = self._get_index_urls()
+        files_left, files_right = self._get_file_urls()
 
-        if not index_urls:
+        if len(files_left) == 0 or len(files_right) == 0:
             raise ValueError(f"No index files found in '{self.config.index_partition}' partition")
 
         # Download index files
-        downloaded_index_files = dl_manager.download(index_urls)
+        hf_fs = HfFileSystem()
 
         # Load all index files into a single table
-        tables = []
-        for file_path in downloaded_index_files:
-            table = pq.read_table(file_path)
-            tables.append(table)
+        left_tables: list[pa.Table] = []
+        right_tables: list[pa.Table] = []
+        import pdb; pdb.set_trace()
+        for f_left, f_right in zip(files_left, files_right):
+            table_left: pa.Table = pq.read_table(
+                                  hf_fs.open(f_left, "rb"),
+                                  columns=CROSS_MATCH_COLS
+                                  )
+            table_right: pa.Table = pq.read_table(
+                                  hf_fs.open(f_right, "rb"),
+                                  columns=CROSS_MATCH_COLS
+            )
+            left_tables.append(table_left)
+            right_tables.append(table_right)
 
-        return tables
+        return pa.concat_tables(left_tables), pa.concat_tables(right_tables)
 
-    def _get_index_urls(self) -> List[str]:
+    def _get_file_urls(self) -> tuple[list[str]]:
         """Get URLs/paths for all files in the _index partition.
 
         Uses HfFileSystem to list files in the repository and filter
@@ -194,13 +211,22 @@ class MMUDatasetBuilder(Parquet):
         # Filter for index partition files (under split_name/_index/)
         import pdb; pdb.set_trace()
         all_files_flat = self.all_files[self.left_name] + self.all_files[self.right_name]
-        index_files = [
-            f for f in all_files_flat
-            if f.endswith("_index/index.parquet")
-        ]
-        index_urls = [f"hf://datasets/{f}" for f in index_files]
+        partitions_left = set()
+        partitions_right = set()
+        for f in self.all_files[self.left_name]:
+            if (match := re.search(FILE_PARTITION_PATTERN, f)):
+                partitions_left.add(match.group(1))
+        for f in self.all_files[self.right_name]:
+            if (match := re.search(FILE_PARTITION_PATTERN, f)):
+                partitions_right.add(match.group(1))
+        common_partitions = partitions_left.intersection(partitions_right)
+        # todo: remove this hack, only to limit test data to process
+        common_partitions = [k for k in common_partitions if "1174" not in k]
 
-        return index_urls
+        files_left = [f"datasets/{f}" for f in self.all_files[self.left_name] if any(part in f for part in common_partitions) and f.endswith(".parquet")] 
+        files_right = [f"datasets/{f}" for f in self.all_files[self.right_name] if any(part in f for part in common_partitions) and f.endswith(".parquet")] 
+
+        return files_left, files_right
 
     def _list_repo_files_single_ds(self, dataset_name):
         if (Path(config.DEFAULT_HF_DATASETS_CACHE) / dataset_name.replace("/", "_")).exists():
