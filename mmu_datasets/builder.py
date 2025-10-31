@@ -84,11 +84,10 @@ class MMUDatasetBuilder(Parquet):
         self.left_name = self.config.left_dataset.split("/")[-1]
         self.right_name = self.config.right_dataset.split("/")[-1]
         self._relevant_partitions: Optional[List[Tuple[int, int]]] = None
+        self.hf_fs = HfFileSystem()
 
     def _download_and_prepare(self, dl_manager, verification_mode, **prepare_split_kwargs):
-        import pdb; pdb.set_trace()
         index_tables = self._download_and_load_crossmatching_cols(dl_manager)
-        import pdb; pdb.set_trace()
         matched_catalog = self.crossmatch_index_tables(*index_tables)
         import pdb; pdb.set_trace()
         self.download_matched_catalog(matched_catalog)
@@ -96,16 +95,49 @@ class MMUDatasetBuilder(Parquet):
     def download_matched_catalog(self, matched_catalog: Table):
         left_object_ids = matched_catalog[f'{self.left_name}_object_id']
         right_object_ids = matched_catalog[f'{self.right_name}_object_id']
-        files_to_download = {k: [f for f in v if f.endswith(".parquet") and not f.endswith("_index/index.parquet")] for k, v in self.all_files.items()}
-        left_files = files_to_download[self.left_name]
-        right_files = files_to_download[self.right_name]
+        left_files = pc.unique(matched_catalog[self.left_name + "_file"]).tolist()
+        right_files = pc.unique(matched_catalog[self.right_name + "_file"]).tolist()
         import pdb; pdb.set_trace()
-        left_table = self._download_files(left_files, left_object_ids)
-        right_table = self._download_files(right_files, right_object_ids)
+        lt_iter = self._download_files(left_files, left_object_ids)
+        rt_iter = self._download_files(right_files, right_object_ids)
         # todo sort tables by matched catalog
+        for left_table, right_table in zip(lt_iter, rt_iter):
+            # todo: we somehow need to "join" by matched_catalog, or sort both tables by that, then concat and save
+            import pdb; pdb.set_trace()
+            break
 
+    def _download_files(self, files, object_ids):
+        # Group files by partition
+        import pdb; pdb.set_trace()
+        partitions: dict[dict[str, list[str]]] = {}
+        for file, obj_id in zip(files, object_ids):
+            match = re.search(FILE_PARTITION_PATTERN, file)
+            if match:
+                partition = match.group(0)
+                if partition not in partitions:
+                    partitions[partition] = {}
+                if file not in partitions[partition]:
+                    partitions[partition] = {file: [obj_id]}
+                else:
+                    partitions[partition][file].append(obj_id)
 
-    def _download_files(self, files: list[str], object_ids) -> pa.Table:
+        # Process each partition and yield the result
+        for partition, file_obj_ids in partitions.items():
+            partition_tables = []
+            for partition_file, object_ids in file_obj_ids.items():
+                # ...existing code to process files...
+                partition_tables.append(self._process_file(partition_file, object_ids))
+            yield pa.concat_tables(partition_tables)
+
+    def _process_file(self, file_name: str, object_ids) -> pa.Table:
+        table = pq.read_table(
+            self.hf_fs.open(file_name, "rb"),
+            filters=pc.field("object_id").isin(pa.array(object_ids))
+        )
+        return table
+
+    # todo: probably remove
+    def _process_files(self, files: list[str], object_ids) -> pa.Table:
         file_paths = [f"datasets/{f}" for f in files]
         hf_fs = HfFileSystem()
 
@@ -182,16 +214,17 @@ class MMUDatasetBuilder(Parquet):
         # Load all index files into a single table
         left_tables: list[pa.Table] = []
         right_tables: list[pa.Table] = []
-        import pdb; pdb.set_trace()
         for f_left, f_right in zip(files_left, files_right):
             table_left: pa.Table = pq.read_table(
                                   hf_fs.open(f_left, "rb"),
                                   columns=CROSS_MATCH_COLS
                                   )
+            table_left = table_left.append_column("file", pa.array([f_left] * table_left.num_rows))
             table_right: pa.Table = pq.read_table(
                                   hf_fs.open(f_right, "rb"),
                                   columns=CROSS_MATCH_COLS
             )
+            table_right = table_right.append_column("file", pa.array([f_right] * table_right.num_rows))
             left_tables.append(table_left)
             right_tables.append(table_right)
 
@@ -209,7 +242,6 @@ class MMUDatasetBuilder(Parquet):
         self.all_files = self._list_repository_files()
 
         # Filter for index partition files (under split_name/_index/)
-        import pdb; pdb.set_trace()
         all_files_flat = self.all_files[self.left_name] + self.all_files[self.right_name]
         partitions_left = set()
         partitions_right = set()
