@@ -89,37 +89,47 @@ class MMUDatasetBuilder(Parquet):
     def _download_and_prepare(self, dl_manager, verification_mode, **prepare_split_kwargs):
         index_tables = self._download_and_load_crossmatching_cols(dl_manager)
         matched_catalog = self.crossmatch_index_tables(*index_tables)
-        import pdb; pdb.set_trace()
+        import ipdb; ipdb.set_trace(context=20)
         self.download_matched_catalog(matched_catalog)
 
     def download_matched_catalog(self, matched_catalog: Table):
         left_object_ids = matched_catalog[f'{self.left_name}_object_id']
         right_object_ids = matched_catalog[f'{self.right_name}_object_id']
         left_files = pc.unique(matched_catalog[self.left_name + "_file"]).tolist()
-        right_files = pc.unique(matched_catalog[self.right_name + "_file"]).tolist()
-        import pdb; pdb.set_trace()
-        lt_iter = self._download_files(left_files, left_object_ids)
-        rt_iter = self._download_files(right_files, right_object_ids)
+        left_grouped = matched_catalog.group_by(self.left_name + "_file")
+        left_files = {group[self.left_name + "_file"][0]: group[self.left_name + "_object_id"].tolist() for group in left_grouped.groups}
+        right_grouped = matched_catalog.group_by(self.left_name + "_file")
+        right_files = {group[self.right_name + "_file"][0]: group[self.right_name + "_object_id"].tolist() for group in right_grouped.groups}
+        lt_iter = self._download_files(left_files)
+        rt_iter = self._download_files(right_files)
         # todo sort tables by matched catalog
+        idx = 0
         for left_table, right_table in zip(lt_iter, rt_iter):
             # todo: we somehow need to "join" by matched_catalog, or sort both tables by that, then concat and save
-            import pdb; pdb.set_trace()
-            break
+            import ipdb; ipdb.set_trace(context=20)
+            l = matched_catalog[matched_catalog[self.left_name + "_object_id"] == left_table['object_id'][0].as_py()]
+            r = matched_catalog[matched_catalog[self.right_name + "_object_id"] == right_table['object_id'][0].as_py()]
 
-    def _download_files(self, files, object_ids):
+            idx += 1
+            if idx > 10:
+                break
+
+    def _download_files(self, files):
         # Group files by partition
-        import pdb; pdb.set_trace()
-        partitions: dict[dict[str, list[str]]] = {}
-        for file, obj_id in zip(files, object_ids):
+        import ipdb; ipdb.set_trace(context=20)
+        partitions: dict[str, dict[str, list[str]]] = {}
+        for file, obj_ids in files.items():
             match = re.search(FILE_PARTITION_PATTERN, file)
             if match:
                 partition = match.group(0)
                 if partition not in partitions:
                     partitions[partition] = {}
                 if file not in partitions[partition]:
-                    partitions[partition] = {file: [obj_id]}
+                    partitions[partition][file] = obj_ids
+                # is this reachable?
                 else:
-                    partitions[partition][file].append(obj_id)
+                    raise ValueError()
+                    partitions[partition][file].extend(obj_ids)
 
         # Process each partition and yield the result
         for partition, file_obj_ids in partitions.items():

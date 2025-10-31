@@ -16,6 +16,7 @@ import numpy as np
 DATASET = "hsc"
 LOCAL_DATA_DIR = Path(f"scripts/data/MultimodalUniverse/v1/{DATASET}")
 REPO_ID = f"TobiasPitters/mmu-{DATASET}-with-coordinates"
+EXAMPLES_PER_CHUNK = 1000  # Number of examples to accumulate before saving
 
 # HSC-specific features
 _FLOAT_FEATURES = [
@@ -49,13 +50,72 @@ hdf5_pattern = "pdr3_dud_22.5/healpix=*/*.hdf5"
 hdf5_files = sorted(LOCAL_DATA_DIR.glob(hdf5_pattern))
 
 # ============================================================================
-# Group data by healpix
+# Helper function to convert examples to PyArrow table
 # ============================================================================
-healpix_data = defaultdict(list)
+def examples_to_table(examples):
+    """Convert list of example dicts to PyArrow table"""
+    data_dict = defaultdict(list)
+    for example in examples:
+        for key, value in example.items():
+            data_dict[key].append(value)
+
+    arrays = []
+    fields = []
+
+    for key in data_dict:
+        if key == "image_band":
+            arrays.append(pa.array(data_dict[key]))
+            fields.append(pa.field(key, pa.list_(pa.string())))
+        elif key.startswith("image_flux") or key.startswith("image_ivar"):
+            flattened = []
+            for obj_bands in data_dict[key]:
+                flattened.append([arr.flatten().tolist() for arr in obj_bands])
+            arrays.append(pa.array(flattened))
+            fields.append(pa.field(key, pa.list_(pa.list_(pa.float32()))))
+        elif key.startswith("image_mask"):
+            flattened = []
+            for obj_bands in data_dict[key]:
+                flattened.append([arr.flatten().tolist() for arr in obj_bands])
+            arrays.append(pa.array(flattened))
+            fields.append(pa.field(key, pa.list_(pa.list_(pa.bool_()))))
+        elif key.startswith("image_"):
+            arrays.append(pa.array(data_dict[key]))
+            fields.append(pa.field(key, pa.list_(pa.float32())))
+        elif key == "object_id":
+            arrays.append(pa.array(data_dict[key], type=pa.string()))
+            fields.append(pa.field(key, pa.string()))
+        elif key in ["ra", "dec"]:
+            arrays.append(pa.array(data_dict[key], type=pa.float64()))
+            fields.append(pa.field(key, pa.float64()))
+        elif key == "healpix":
+            arrays.append(pa.array(data_dict[key], type=pa.int64()))
+            fields.append(pa.field(key, pa.int64()))
+        else:
+            arrays.append(pa.array(data_dict[key], type=pa.float32()))
+            fields.append(pa.field(key, pa.float32()))
+
+    schema = pa.schema(fields)
+    return pa.Table.from_arrays(arrays, schema=schema)
+
+# ============================================================================
+# Create output directory structure
+# ============================================================================
+upload_path = Path(f"output_dataset/{DATASET}_with_coords")
+output_dir = upload_path / "train"
+output_dir.mkdir(parents=True, exist_ok=True)
+
+# ============================================================================
+# Process data in chunks by healpix
+# ============================================================================
+# Track how many chunks per healpix and current buffer
+healpix_chunk_counts = defaultdict(int)
+healpix_buffers = defaultdict(list)
 
 for hdf5_file in hdf5_files:
+    print(f"Processing {hdf5_file}...")
     with h5py.File(hdf5_file, "r") as f:
         num_objects = len(f["object_id"][:])
+        print(f"  Found {num_objects} objects")
 
         for i in range(num_objects):
             example = {}
@@ -95,76 +155,59 @@ for hdf5_file in hdf5_files:
             example["dec"] = f["dec"][i]
             example["healpix"] = f["healpix"][i]
 
-            # Group by healpix
-            healpix_data[example["healpix"]].append(example)
+            # Add to buffer
+            hp_value = example["healpix"]
+            healpix_buffers[hp_value].append(example)
+
+            # Save chunk if buffer is full
+            if len(healpix_buffers[hp_value]) >= EXAMPLES_PER_CHUNK:
+                hp_dir = output_dir / f"healpix={hp_value}"
+                hp_dir.mkdir(exist_ok=True)
+
+                chunk_idx = healpix_chunk_counts[hp_value]
+                filename = f"train-{chunk_idx:05d}.parquet"
+
+                table = examples_to_table(healpix_buffers[hp_value])
+                pq.write_table(table, hp_dir / filename)
+
+                print(f"  Saved {filename} with {len(healpix_buffers[hp_value])} examples")
+
+                # Clear buffer and increment chunk count
+                healpix_buffers[hp_value] = []
+                healpix_chunk_counts[hp_value] += 1
 
 # ============================================================================
-# Create output directory structure
+# Save remaining data in buffers
 # ============================================================================
-upload_path = Path(f"output_dataset/{DATASET}_with_coords")
-output_dir = upload_path / "train"
-output_dir.mkdir(parents=True, exist_ok=True)
+print("\nSaving remaining buffered data...")
+for hp_value, examples in healpix_buffers.items():
+    if len(examples) > 0:
+        hp_dir = output_dir / f"healpix={hp_value}"
+        hp_dir.mkdir(exist_ok=True)
+
+        chunk_idx = healpix_chunk_counts[hp_value]
+        filename = f"train-{chunk_idx:05d}.parquet"
+
+        table = examples_to_table(examples)
+        pq.write_table(table, hp_dir / filename)
+
+        print(f"  Saved {filename} with {len(examples)} examples")
+        healpix_chunk_counts[hp_value] += 1
 
 # ============================================================================
-# Save each healpix partition as parquet
+# Rename files to include total count
 # ============================================================================
-for idx, (hp_value, examples) in enumerate(healpix_data.items()):
+print("\nRenaming files with total count...")
+for hp_value, total_chunks in healpix_chunk_counts.items():
     hp_dir = output_dir / f"healpix={hp_value}"
-    hp_dir.mkdir(exist_ok=True)
 
-    # Convert list of dicts to dict of lists
-    data_dict = defaultdict(list)
-    for example in examples:
-        for key, value in example.items():
-            data_dict[key].append(value)
+    for chunk_idx in range(total_chunks):
+        old_name = hp_dir / f"train-{chunk_idx:05d}.parquet"
+        new_name = hp_dir / f"train-{chunk_idx:05d}-of-{total_chunks:05d}.parquet"
 
-    # Create PyArrow table
-    arrays = []
-    fields = []
-
-    for key in data_dict:
-        if key == "image_band":
-            # List of strings (5 bands per object)
-            arrays.append(pa.array(data_dict[key]))
-            fields.append(pa.field(key, pa.list_(pa.string())))
-        elif key.startswith("image_flux") or key.startswith("image_ivar"):
-            # List of 2D arrays (160x160)
-            # Need to flatten each 2D array into a list
-            flattened = []
-            for obj_bands in data_dict[key]:
-                flattened.append([arr.flatten().tolist() for arr in obj_bands])
-            arrays.append(pa.array(flattened))
-            fields.append(pa.field(key, pa.list_(pa.list_(pa.float32()))))
-        elif key.startswith("image_mask"):
-            # List of 2D bool arrays
-            flattened = []
-            for obj_bands in data_dict[key]:
-                flattened.append([arr.flatten().tolist() for arr in obj_bands])
-            arrays.append(pa.array(flattened))
-            fields.append(pa.field(key, pa.list_(pa.list_(pa.bool_()))))
-        elif key.startswith("image_"):
-            # image_psf_fwhm and image_scale - list of floats (5 per object)
-            arrays.append(pa.array(data_dict[key]))
-            fields.append(pa.field(key, pa.list_(pa.float32())))
-        elif key == "object_id":
-            arrays.append(pa.array(data_dict[key], type=pa.string()))
-            fields.append(pa.field(key, pa.string()))
-        elif key in ["ra", "dec"]:
-            arrays.append(pa.array(data_dict[key], type=pa.float64()))
-            fields.append(pa.field(key, pa.float64()))
-        elif key == "healpix":
-            arrays.append(pa.array(data_dict[key], type=pa.int64()))
-            fields.append(pa.field(key, pa.int64()))
-        else:
-            # Float features
-            arrays.append(pa.array(data_dict[key], type=pa.float32()))
-            fields.append(pa.field(key, pa.float32()))
-
-    schema = pa.schema(fields)
-    table = pa.Table.from_arrays(arrays, schema=schema)
-
-    # Write parquet file
-    pq.write_table(table, hp_dir / "data.parquet")
+        if old_name.exists():
+            old_name.rename(new_name)
+            print(f"  Renamed {old_name.name} -> {new_name.name}")
 
 # ============================================================================
 # Upload to HuggingFace Hub
