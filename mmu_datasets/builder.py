@@ -89,12 +89,9 @@ class MMUDatasetBuilder(Parquet):
     def _download_and_prepare(self, dl_manager, verification_mode, **prepare_split_kwargs):
         index_tables = self._download_and_load_crossmatching_cols(dl_manager)
         matched_catalog = self.crossmatch_index_tables(*index_tables)
-        import ipdb; ipdb.set_trace(context=20)
         self.download_matched_catalog(matched_catalog)
 
     def download_matched_catalog(self, matched_catalog: Table):
-        left_object_ids = matched_catalog[f'{self.left_name}_object_id']
-        right_object_ids = matched_catalog[f'{self.right_name}_object_id']
         left_files = pc.unique(matched_catalog[self.left_name + "_file"]).tolist()
         left_grouped = matched_catalog.group_by(self.left_name + "_file")
         left_files = {group[self.left_name + "_file"][0]: group[self.left_name + "_object_id"].tolist() for group in left_grouped.groups}
@@ -104,8 +101,13 @@ class MMUDatasetBuilder(Parquet):
         rt_iter = self._download_files(right_files)
         # todo sort tables by matched catalog
         idx = 0
+
+        mc_objects = pa.table(matched_catalog[[self.left_name + "_object_id", self.right_name + "_object_id"]].to_pandas())
         for left_table, right_table in zip(lt_iter, rt_iter):
-            # todo: we somehow need to "join" by matched_catalog, or sort both tables by that, then concat and save
+            # todo: join left to matched catalog, then result on right, use left_prefix, right_prefix for coordinate_columns
+            lm = left_table.join(mc_objects, keys="object_id", right_keys=self.left_name + "_object_id", join_type="inner")
+            lmr = lm.join(right_table, keys=self.right_name + "_object_id", join_type="inner", left_prefix=self.left_name + "_", right_prefix=self.right_name + "_")
+
             import ipdb; ipdb.set_trace(context=20)
             l = matched_catalog[matched_catalog[self.left_name + "_object_id"] == left_table['object_id'][0].as_py()]
             r = matched_catalog[matched_catalog[self.right_name + "_object_id"] == right_table['object_id'][0].as_py()]
@@ -116,7 +118,6 @@ class MMUDatasetBuilder(Parquet):
 
     def _download_files(self, files):
         # Group files by partition
-        import ipdb; ipdb.set_trace(context=20)
         partitions: dict[str, dict[str, list[str]]] = {}
         for file, obj_ids in files.items():
             match = re.search(FILE_PARTITION_PATTERN, file)
