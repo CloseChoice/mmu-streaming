@@ -1,7 +1,5 @@
-#!/usr/bin/env python3
 # Direct HDF5 to partitioned parquet conversion
 # Run with: python data_creation/hdf5_to_partitioned_parquet.py
-
 import h5py
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -10,28 +8,20 @@ from huggingface_hub import create_repo, HfApi
 from collections import defaultdict
 import numpy as np
 
-# ============================================================================
-# Configuration
-# ============================================================================
 DATASET = "sdss"  # or "hsc"
 LOCAL_DATA_DIR = Path(f"scripts/data/MultimodalUniverse/v1/{DATASET}")
 REPO_ID = f"TobiasPitters/mmu-{DATASET}-with-coordinates"
 
-# SDSS-specific features
 _FLOAT_FEATURES = ["VDISP", "VDISP_ERR", "Z", "Z_ERR"]
 _FLUX_FEATURES = ["SPECTROFLUX", "SPECTROFLUX_IVAR", "SPECTROSYNFLUX", "SPECTROSYNFLUX_IVAR"]
 _FLUX_FILTERS = ['U', 'G', 'R', 'I', 'Z']
 _BOOL_FEATURES = ["ZWARNING"]
 
-# ============================================================================
 # Find all HDF5 files
-# ============================================================================
 hdf5_pattern = "sdss/healpix=*/*.hdf5" if DATASET == "sdss" else "pdr3_dud_22.5/healpix=*/*.hdf5"
 hdf5_files = sorted(LOCAL_DATA_DIR.glob(hdf5_pattern))
 
-# ============================================================================
 # Group data by healpix
-# ============================================================================
 healpix_data = defaultdict(list)
 
 for hdf5_file in hdf5_files:
@@ -39,30 +29,24 @@ for hdf5_file in hdf5_files:
         num_objects = len(f["object_id"][:])
 
         for i in range(num_objects):
-            # Extract all data for this object
             example = {}
 
-            # Spectrum data
             example["spectrum_flux"] = f["spectrum_flux"][i]
             example["spectrum_ivar"] = f["spectrum_ivar"][i]
             example["spectrum_lsf_sigma"] = f["spectrum_lsf_sigma"][i]
             example["spectrum_lambda"] = f["spectrum_lambda"][i]
             example["spectrum_mask"] = f["spectrum_mask"][i]
 
-            # Float features
             for feat in _FLOAT_FEATURES:
                 example[feat] = f[feat][i].astype("float32")
 
-            # Flux features (5 bands each)
             for feat in _FLUX_FEATURES:
                 for n, band in enumerate(_FLUX_FILTERS):
                     example[f"{feat}_{band}"] = f[feat][i][n].astype("float32")
 
-            # Bool features
             for feat in _BOOL_FEATURES:
                 example[feat] = bool(f[feat][i])
 
-            # Object ID and coordinates
             obj_id = f["object_id"][i]
             if isinstance(obj_id, bytes):
                 obj_id = obj_id.decode('utf-8')
@@ -77,16 +61,12 @@ for hdf5_file in hdf5_files:
             # Group by healpix
             healpix_data[example["healpix"]].append(example)
 
-# ============================================================================
 # Create output directory structure
-# ============================================================================
 upload_path = Path(f"output_dataset/{DATASET}_with_coords")
 output_dir = upload_path / "train"
 output_dir.mkdir(parents=True, exist_ok=True)
 
-# ============================================================================
 # Save each healpix partition as parquet
-# ============================================================================
 for idx, (hp_value, examples) in enumerate(healpix_data.items()):
     hp_dir = output_dir / f"healpix={hp_value}"
     hp_dir.mkdir(exist_ok=True)
