@@ -48,25 +48,17 @@ def infer_schema_from_hdf5(f):
     return pa.schema(fields)
 
 def transform_func(batch: pa.Table):
-    struct_type = pa.struct([
-        pa.field("flux", pa.list_(pa.float32())),
-        pa.field("ivar", pa.list_(pa.float32())),
-        pa.field("lambda", pa.list_(pa.float32())),
-        pa.field("mask", pa.list_(pa.float32()))
-    ])
-    # this is pretty slow!
-    batch = batch.append_column(
-        "spectrum",
-        pa.array([
-            {
-                "flux": batch["spectrum_flux"][i],
-                "ivar": batch["spectrum_noise"][i],
-                "lambda": batch["spectrum_wave"][i],
-                "mask": batch["spectrum_mask"][i]
-            }
-            for i in range(batch.num_rows)
-        ], type=struct_type)
+    spectrum_col = pa.StructArray.from_arrays(
+          [
+              batch["spectrum_flux"],
+              batch["spectrum_noise"],
+              batch["spectrum_wave"],
+              batch["spectrum_mask"]
+          ],
+          names=["flux", "ivar", "lambda", "mask"]
     )
+    batch = batch.append_column("spectrum", spectrum_col)
+
     return batch, batch.schema
 
 
