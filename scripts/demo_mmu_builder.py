@@ -19,7 +19,7 @@ def demo_simple_loading():
         right_dataset="TobiasPitters/mmu-hsc-with-coordinates",
         # MMU-specific config params (no type annotations in function calls!)
         split_name="train",
-        index_partition="_index",
+        # download_config="force_redownload",
         columns=None,  # Load all columns, or specify: ["ra", "dec", "flux"]
     )
 
@@ -36,7 +36,7 @@ def demo_crossmatching():
         cache_dir=None,
         data_dir="TobiasPitters/mmu-sdss-partitioned",
         split_name="train",
-        index_partition="_index",
+        download_config="force_redownload",
         # Crossmatching configuration
         matching_datasets={
             "hsc": "TobiasPitters/mmu-hsc-partitioned"

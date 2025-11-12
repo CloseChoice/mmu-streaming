@@ -151,15 +151,19 @@ class MMUDatasetBuilder(Parquet):
                            for group in right_grouped.groups}
 
             # Download and join data
+            # we don't need to yield here, we can just get the full tables
             lt_iter = self._download_files_single_partition(left_files)
             rt_iter = self._download_files_single_partition(right_files)
 
+            # todo: can be cast directly to polars
             mc_objects = pa.table(partition_catalog[[self.left_name + "_object_id",
                                                     self.right_name + "_object_id"]].to_pandas())
 
             partition_tables = []
+            # todo: this can only work if the files are correctly grouped by partition!!! And lt_iter and rt_iter have the same length -> change lt_iter and rt_iter to tables
             for left_table, right_table in zip(lt_iter, rt_iter):
                 # Join left with matched catalog
+                print("Joining tables for partition:", partition_name, "left rows:", left_table.num_rows, "right rows:", right_table.num_rows)
                 lm = pl.from_arrow(left_table).join(
                     pl.from_arrow(mc_objects),
                     left_on="object_id",
@@ -204,8 +208,11 @@ class MMUDatasetBuilder(Parquet):
         Yields:
             PyArrow tables for each file
         """
+        partition_tables = []
         for file, obj_ids in files.items():
-            yield self._process_file(file, obj_ids)
+            table = self._process_file(file, obj_ids)
+            partition_tables.append(table)
+        yield pa.concat_tables(partition_tables)
 
     def _build_single_dataset(
         self,
@@ -251,55 +258,17 @@ class MMUDatasetBuilder(Parquet):
         else:
             return concatenate_datasets(datasets)
 
-    def _download_files(self, files):
-        # Group files by partition
-        partitions: dict[str, dict[str, list[str]]] = {}
-        for file, obj_ids in files.items():
-            match = re.search(FILE_PARTITION_PATTERN, file)
-            if match:
-                partition = match.group(0)
-                if partition not in partitions:
-                    partitions[partition] = {}
-                if file not in partitions[partition]:
-                    partitions[partition][file] = obj_ids
-                # is this reachable?
-                else:
-                    raise ValueError()
-                    partitions[partition][file].extend(obj_ids)
-
-        # Process each partition and yield the result
-        for partition, file_obj_ids in partitions.items():
-            partition_tables = []
-            for partition_file, object_ids in file_obj_ids.items():
-                # ...existing code to process files...
-                partition_tables.append(self._process_file(partition_file, object_ids))
-            yield pa.concat_tables(partition_tables)
-
     def _process_file(self, file_name: str, object_ids) -> pa.Table:
+        print("Downloading and filtering file:", file_name, "for", len(object_ids), "object IDs")
         table = pq.read_table(
             self.hf_fs.open(file_name, "rb"),
             filters=pc.field("object_id").isin(pa.array(object_ids))
         )
         return table
 
-    # todo: probably remove
-    def _process_files(self, files: list[str], object_ids) -> pa.Table:
-        file_paths = [f"datasets/{f}" for f in files]
-        hf_fs = HfFileSystem()
-
-        tables = []
-
-        for file_path in file_paths:
-            table = pq.read_table(
-                hf_fs.open(file_path, "rb"),
-                filters=pc.field("object_id").isin(pa.array(object_ids))
-            )
-            tables.append(table)
-        return pa.concat_tables(tables)
-
     def crossmatch_index_tables(self, left, right,
                                 # todo: change back to one
-                                matching_radius : float = 2000., 
+                                matching_radius : float = 1., 
                                 ):
         left = Table.from_pandas(left.to_pandas())
         right = Table.from_pandas(right.to_pandas())
@@ -321,6 +290,7 @@ class MMUDatasetBuilder(Parquet):
         matched_catalog = hstack([cat_left, cat_right], 
                                  table_names=[self.left_name, self.right_name],
                                  uniq_col_name='{table_name}_{col_name}')
+        # todo: why do we do this? This is not strictly necessary for our implementation, we could simply include these!!
         # Remove objects that were matched between the two catalogs but fall under different healpix indices
         mask = matched_catalog[f'{self.left_name}_healpix'] == matched_catalog[f'{self.right_name}_healpix']
         matched_catalog = matched_catalog[mask]
@@ -360,18 +330,19 @@ class MMUDatasetBuilder(Parquet):
         # Load all index files into a single table
         left_tables: list[pa.Table] = []
         right_tables: list[pa.Table] = []
-        for f_left, f_right in zip(files_left, files_right):
+        for f_left in files_left:
             table_left: pa.Table = pq.read_table(
                                   hf_fs.open(f_left, "rb"),
                                   columns=CROSS_MATCH_COLS
                                   )
             table_left = table_left.append_column("file", pa.array([f_left] * table_left.num_rows))
+            left_tables.append(table_left)
+        for f_right in files_right:
             table_right: pa.Table = pq.read_table(
                                   hf_fs.open(f_right, "rb"),
                                   columns=CROSS_MATCH_COLS
             )
             table_right = table_right.append_column("file", pa.array([f_right] * table_right.num_rows))
-            left_tables.append(table_left)
             right_tables.append(table_right)
 
         return pa.concat_tables(left_tables), pa.concat_tables(right_tables)
@@ -399,7 +370,7 @@ class MMUDatasetBuilder(Parquet):
                 partitions_right.add(match.group(1))
         common_partitions = partitions_left.intersection(partitions_right)
         # todo: remove this hack, only to limit test data to process
-        common_partitions = [k for k in common_partitions if "1174" not in k]
+        # common_partitions = [k for k in common_partitions if "1174" not in k]
 
         files_left = [f"datasets/{f}" for f in self.all_files[self.left_name] if any(part in f for part in common_partitions) and f.endswith(".parquet")] 
         files_right = [f"datasets/{f}" for f in self.all_files[self.right_name] if any(part in f for part in common_partitions) and f.endswith(".parquet")] 

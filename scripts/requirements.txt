@@ -3,3 +3,5 @@ git+https://github.com/MultimodalUniverse/MultimodalUniverse.git
 astropy==7.1
 scipy
 numpy<2
+h5py
+hats-import
