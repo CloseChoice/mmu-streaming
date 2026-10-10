@@ -1,4 +1,4 @@
-datasets==3.6
+datasets==5.0.1
 git+https://github.com/MultimodalUniverse/MultimodalUniverse.git
 astropy==7.1
 scipy
